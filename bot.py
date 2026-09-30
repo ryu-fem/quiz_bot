@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -80,7 +79,6 @@ def save_config(cfg: dict) -> None:
 
 
 OPEN_ACCESS = os.environ.get("OPEN_ACCESS", "true").strip().lower() not in {"false", "0", "no"}
-DAILY_LIMIT = int(os.environ.get("USER_DAILY_LIMIT", "15"))  # رسائل AI في اليوم للمستخدم العادي
 MAX_CHARS_USER = int(os.environ.get("USER_MAX_CHARS", "15000"))  # أقصى حجم رسالة للمستخدم العادي
 AI_SEM = asyncio.Semaphore(int(os.environ.get("AI_CONCURRENCY", "3")))  # عدد طلبات AI في نفس الوقت
 
@@ -91,21 +89,6 @@ def is_admin(user_id: int) -> bool:
 
 def can_use(user_id: int) -> bool:
     return OPEN_ACCESS or is_admin(user_id)
-
-
-def check_quota(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str | None:
-    """بيرجع رسالة رفض لو المستخدم العادي وصل للحد اليومي. الأدمن من غير حدود."""
-    if is_admin(user_id):
-        return None
-    today = date.today().isoformat()
-    usage = context.bot_data.setdefault("usage", {})
-    day, n = usage.get(user_id, (today, 0))
-    if day != today:
-        day, n = today, 0
-    if n >= DAILY_LIMIT:
-        return f"وصلت للحد اليومي ({DAILY_LIMIT} رسالة). جرب تاني بكرة."
-    usage[user_id] = (day, n + 1)
-    return None
 
 
 # ---------------------------------------------------------------- AI providers
@@ -397,8 +380,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔥 عنوان فوق كل سؤال (off للإلغاء):\n"
             "/prefix Grammar"
         )
-    elif OPEN_ACCESS:
-        text += f"\n\nالحد اليومي: {DAILY_LIMIT} رسالة."
     await update.message.reply_text(text)
 
 
@@ -508,10 +489,6 @@ async def handle_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     uid = update.effective_user.id
     if not is_admin(uid) and len(text) > MAX_CHARS_USER:
         await msg.reply_text("الرسالة كبيرة أوي. قسمها على كذا رسالة.")
-        return
-    refusal = check_quota(context, uid)
-    if refusal:
-        await msg.reply_text(refusal)
         return
     wait = await msg.reply_text("⏳ بفهم الأسئلة...")
     async def progress(i: int, n: int):
