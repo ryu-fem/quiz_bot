@@ -112,8 +112,18 @@ MAX_CHARS_USER = int(os.environ.get("USER_MAX_CHARS", "15000"))  # أقصى حج
 AI_SEM = asyncio.Semaphore(int(os.environ.get("AI_CONCURRENCY", "3")))  # عدد طلبات AI في نفس الوقت
 
 
+# أدمنز مضافين بالأمر /addadmin (متخزنين في ملف الإعدادات). الأدمنز الأساسيين في ADMIN_IDS.
+EXTRA_ADMINS: set = {int(x) for x in _read_file().get("extra_admins", []) if str(x).isdigit()}
+
+
+def _save_extra_admins() -> None:
+    raw = _read_file()
+    raw["extra_admins"] = sorted(EXTRA_ADMINS)
+    CONFIG_FILE.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return user_id in ADMIN_IDS or user_id in EXTRA_ADMINS
 
 
 def can_use(user_id: int) -> bool:
@@ -414,7 +424,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📍 مكان النشر بتاعك (قناة أو جروب). كل أدمن بيحدد مكانه لوحده:\n"
             "/target @channel\n\n"
             "🔥 عنوان فوق كل سؤالك (off للإلغاء):\n"
-            "/prefix Grammar"
+            "/prefix Grammar\n\n"
+            "👥 إضافة وحذف أدمن (للأدمن الأساسي بس):\n"
+            "/addadmin 123456789\n"
+            "/removeadmin 123456789\n\n"
+            "📋 قايمة الأدمنز:\n"
+            "/admins"
         )
     await update.message.reply_text(text)
 
@@ -476,6 +491,58 @@ async def cmd_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         set_user_cfg(uid, prefix=text)
         await update.message.reply_text(f"تمام، العنوان: {text}")
+
+
+async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("الأمر ده للأدمن الأساسي بس (اللي في ADMIN_IDS).")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "اكتب الأمر مع الـ id بتاع الشخص:\n/addadmin 123456789\n\n"
+            "الشخص يبعت /id للبوت وهيرد عليه برقمه."
+        )
+        return
+    new = int(context.args[0])
+    if is_admin(new):
+        await update.message.reply_text("هو أدمن أصلاً.")
+        return
+    EXTRA_ADMINS.add(new)
+    _save_extra_admins()
+    text = f"✅ اتضاف {new} أدمن. يقدر يحدد قناته بـ /target."
+    if not os.environ.get("CONFIG_PATH"):
+        text += "\n\nملاحظة: لو البوت على استضافة بتمسح الملفات مع كل تشغيل، ضيفه كمان في ADMIN_IDS عشان يفضل أدمن."
+    await update.message.reply_text(text)
+    try:
+        await context.bot.send_message(new, "✅ اتضفت أدمن في البوت. ابعت /help تشوف الأوامر.")
+    except TelegramError:
+        pass  # لسه ما بدأش البوت، عادي
+
+
+async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("الأمر ده للأدمن الأساسي بس (اللي في ADMIN_IDS).")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("اكتب الأمر مع الـ id:\n/removeadmin 123456789")
+        return
+    target = int(context.args[0])
+    if target in ADMIN_IDS:
+        await update.message.reply_text("ده أدمن أساسي، شيله من ADMIN_IDS.")
+    elif target in EXTRA_ADMINS:
+        EXTRA_ADMINS.discard(target)
+        _save_extra_admins()
+        await update.message.reply_text(f"✅ اتشال {target} من الأدمنز.")
+    else:
+        await update.message.reply_text("مش أدمن أصلاً.")
+
+
+async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    base = "\n".join(f"• {x}" for x in sorted(ADMIN_IDS)) or "-"
+    extra = "\n".join(f"• {x}" for x in sorted(EXTRA_ADMINS)) or "-"
+    await update.message.reply_text(f"👑 الأدمنز الأساسيين:\n{base}\n\n👥 الأدمنز المضافين:\n{extra}")
 
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -678,6 +745,9 @@ def main():
     app.add_handler(CommandHandler("target", cmd_target))
     app.add_handler(CommandHandler("prefix", cmd_prefix))
     app.add_handler(CommandHandler("undo", cmd_undo))
+    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
+    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
+    app.add_handler(CommandHandler("admins", cmd_admins))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
