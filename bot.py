@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,7 +20,7 @@ try:  # جيميناي اختياري
     from google.genai import types
 except ImportError:  # pragma: no cover
     genai = genai_errors = types = None
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Poll, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Poll, Update
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -78,8 +79,33 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+OPEN_ACCESS = os.environ.get("OPEN_ACCESS", "true").strip().lower() not in {"false", "0", "no"}
+DAILY_LIMIT = int(os.environ.get("USER_DAILY_LIMIT", "15"))  # رسائل AI في اليوم للمستخدم العادي
+MAX_CHARS_USER = int(os.environ.get("USER_MAX_CHARS", "15000"))  # أقصى حجم رسالة للمستخدم العادي
+AI_SEM = asyncio.Semaphore(int(os.environ.get("AI_CONCURRENCY", "3")))  # عدد طلبات AI في نفس الوقت
+
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def can_use(user_id: int) -> bool:
+    return OPEN_ACCESS or is_admin(user_id)
+
+
+def check_quota(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str | None:
+    """بيرجع رسالة رفض لو المستخدم العادي وصل للحد اليومي. الأدمن من غير حدود."""
+    if is_admin(user_id):
+        return None
+    today = date.today().isoformat()
+    usage = context.bot_data.setdefault("usage", {})
+    day, n = usage.get(user_id, (today, 0))
+    if day != today:
+        day, n = today, 0
+    if n >= DAILY_LIMIT:
+        return f"وصلت للحد اليومي ({DAILY_LIMIT} رسالة). جرب تاني بكرة."
+    usage[user_id] = (day, n + 1)
+    return None
 
 
 # ---------------------------------------------------------------- AI providers
@@ -217,7 +243,8 @@ async def parse_questions(text: str, progress=None) -> list[dict]:
     for i, c in enumerate(chunks, 1):
         if progress and len(chunks) > 1:
             await progress(i, len(chunks))
-        out.extend(await parse_chunk(c))
+        async with AI_SEM:
+            out.extend(await parse_chunk(c))
         if i < len(chunks):
             await asyncio.sleep(2)
     return out
@@ -238,17 +265,30 @@ def btn(label: str, data: str) -> InlineKeyboardButton:
 
 
 def preview_view(draft: list[dict]):
-    prefix = load_config().get("prefix", "")
-    lines = [f"📋 لقيت {len(draft)} سؤال" + (f" (العنوان: {prefix})" if prefix else "") + "\n"]
+    n = len(draft)
+    qw, aw = (70, 40) if n <= 20 else (50, 30) if n <= 40 else (38, 22)
+    missing = sum(1 for q in draft if q["correct"] is None)
+    head = f"📋 لقيت {n} سؤال\n"
+    if missing:
+        head += f"⚠️ {missing} سؤال من غير إجابة صح (لازم تحددها قبل النشر)\n"
+    foot = "\nابعت رقم السؤال لتعديله، أو دوس نشر."
+    lines, used = [], len(head) + len(foot) + 80
     for i, q in enumerate(draft, 1):
-        ans = q["options"][q["correct"]] if q["correct"] is not None else "⚠️ مفيش إجابة صح"
-        long_flag = " 📏طويل" if len(q["question"]) > Q_MAX or len(q["explanation"]) > EXP_MAX or any(len(o) > OPT_MAX for o in q["options"]) else ""
-        long_flag += " 💡" if q["explanation"] else ""
-        lines.append(f"{i}. {short(q['question'], 70)}\n   ✅ {short(ans, 40)}{long_flag}")
-    lines.append("\nابعت رقم السؤال لتعديله، أو دوس نشر.")
-    text = "\n".join(lines)
-    if len(text) > 3900:
-        text = text[:3900] + "…"
+        ans = "✅ " + q["options"][q["correct"]] if q["correct"] is not None else "⚠️ مفيش إجابة صح"
+        flags = ""
+        if len(q["question"]) > Q_MAX or len(q["explanation"]) > EXP_MAX or any(len(o) > OPT_MAX for o in q["options"]):
+            flags += " 📏"
+        if q["explanation"]:
+            flags += " 💡"
+        line = f"{i}. {short(q['question'], qw)}\n   {short(ans, aw)}{flags}"
+        if used + len(line) + 1 > 3800:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    text = head + "\n" + "\n".join(lines)
+    if len(lines) < n:
+        text += f"\n… و{n - len(lines)} سؤال كمان (ابعت رقم أي سؤال لتعديله)"
+    text += foot
     kb = InlineKeyboardMarkup([[btn("✅ نشر الكل", "pub"), btn("❌ إلغاء", "cancel")]])
     return text, kb
 
@@ -280,8 +320,9 @@ async def send_with_retry(coro_factory):
             await asyncio.sleep(e.retry_after + 1)
 
 
-async def publish(context: ContextTypes.DEFAULT_TYPE, draft: list[dict], default_chat: int):
-    cfg = load_config()
+async def publish(context: ContextTypes.DEFAULT_TYPE, draft: list[dict], default_chat: int, admin: bool = False):
+    # المستخدم العادي بينزل عنده هو بس. القناة والعنوان للأدمن.
+    cfg = load_config() if admin else {}
     chat_id = cfg.get("target") or default_chat
     prefix = cfg.get("prefix", "")
     ids, failed = [], []
@@ -310,7 +351,7 @@ async def publish(context: ContextTypes.DEFAULT_TYPE, draft: list[dict], default
             log.warning("poll %s failed: %s", n, e)
             failed.append((n, str(e)))
         await asyncio.sleep(1.2)
-    context.bot_data["last_batch"] = {"chat": chat_id, "ids": ids, "draft": draft}
+    context.user_data["last_batch"] = {"chat": chat_id, "ids": ids, "draft": draft}
     return failed
 
 
@@ -320,26 +361,60 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not can_use(update.effective_user.id):
         await update.message.reply_text(f"البوت خاص. الـ id بتاعك: {update.effective_user.id}")
         return
     await update.message.reply_text(
-        "ابعتلي الأسئلة والإجابات بأي شكل (نص أو ملف txt) وأنا هحولها Quiz Polls.\n"
-        "💡 لو الأسئلة كتير، الأفضل الإجابة تكون جنب كل سؤال مش في آخر الرسالة.\n\n"
+        "👋 أهلاً! ابعتلي أسئلتك مع إجاباتها بأي شكل (نص أو ملف txt) وأنا أحولها Quiz Polls جاهزة.\n\n"
+        "للتفاصيل: /help"
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not can_use(uid):
+        return
+    text = (
+        "📖 طريقة الاستخدام\n\n"
+        "1️⃣ ابعت الأسئلة والإجابات (نص أو ملف txt) بأي شكل.\n"
+        "2️⃣ هتظهرلك معاينة. ابعت رقم أي سؤال عشان تعدل نصه أو خياراته أو الإجابة الصح أو الشرح، أو تحذفه.\n"
+        "3️⃣ دوس \"نشر الكل\" وتنزل Quiz Polls جاهزة.\n\n"
+        "💡 لو الأسئلة كتير خلي الإجابة جنب كل سؤال مش في آخر الرسالة.\n"
+        "💡 لو فيه تعليل للإجابة اكتبه وهيتحط في الـ Poll، ولو مفيش هيتعمل عادي.\n\n"
         "الأوامر:\n\n"
-        "📍 مكان النشر (من غير ما تحدده بينشر هنا):\n"
-        "/target @channel\n\n"
-        "🔥 عنوان فوق كل سؤال (off للإلغاء):\n"
-        "/prefix Grammar\n\n"
-        "↩️ يمسح آخر دفعة اتنشرت ويرجعها للتعديل:\n"
+        "↩️ مسح آخر دفعة اتنشرت ورجوعها للتعديل:\n"
         "/undo\n\n"
-        "🆔 يعرفك الـ user id:\n"
+        "❌ إلغاء المسودة الحالية:\n"
+        "/cancel\n\n"
+        "🆔 معرفة الـ user id:\n"
         "/id"
     )
+    if is_admin(uid):
+        text += (
+            "\n\n👑 للأدمن فقط:\n\n"
+            "📍 مكان النشر (القناة أو الجروب):\n"
+            "/target @channel\n\n"
+            "🔥 عنوان فوق كل سؤال (off للإلغاء):\n"
+            "/prefix Grammar"
+        )
+    elif OPEN_ACCESS:
+        text += f"\n\nالحد اليومي: {DAILY_LIMIT} رسالة."
+    await update.message.reply_text(text)
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_use(update.effective_user.id):
+        return
+    context.user_data.pop("awaiting", None)
+    if context.user_data.pop("draft", None):
+        await update.message.reply_text("❌ اتلغت المسودة.")
+    else:
+        await update.message.reply_text("مفيش مسودة أصلاً.")
 
 
 async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
+        await update.message.reply_text("الأمر ده للأدمن بس.")
         return
     if not context.args:
         cur = load_config().get("target")
@@ -360,6 +435,7 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
+        await update.message.reply_text("الأمر ده للأدمن بس.")
         return
     cfg = load_config()
     text = " ".join(context.args).strip()
@@ -376,9 +452,9 @@ async def cmd_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not can_use(update.effective_user.id):
         return
-    batch = context.bot_data.get("last_batch")
+    batch = context.user_data.get("last_batch")
     if not batch:
         await update.message.reply_text("مفيش دفعة أمسحها.")
         return
@@ -389,7 +465,7 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await asyncio.sleep(0.3)
     context.user_data["draft"] = batch["draft"]
-    context.bot_data.pop("last_batch", None)
+    context.user_data.pop("last_batch", None)
     text, kb = preview_view(batch["draft"])
     await update.message.reply_text("🗑 اتمسحت. رجعتها للتعديل:\n\n" + text, reply_markup=kb)
 
@@ -429,6 +505,14 @@ async def handle_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         return
 
     # 3) أسئلة جديدة -> AI
+    uid = update.effective_user.id
+    if not is_admin(uid) and len(text) > MAX_CHARS_USER:
+        await msg.reply_text("الرسالة كبيرة أوي. قسمها على كذا رسالة.")
+        return
+    refusal = check_quota(context, uid)
+    if refusal:
+        await msg.reply_text(refusal)
+        return
     wait = await msg.reply_text("⏳ بفهم الأسئلة...")
     async def progress(i: int, n: int):
         try:
@@ -451,13 +535,13 @@ async def handle_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not can_use(update.effective_user.id):
         return
     await handle_input_text(update, context, update.message.text)
 
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not can_use(update.effective_user.id):
         return
     doc = update.message.document
     if not (doc.mime_type or "").startswith("text/") and not (doc.file_name or "").endswith(".txt"):
@@ -471,7 +555,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------- buttons
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not is_admin(q.from_user.id):
+    if not can_use(q.from_user.id):
         await q.answer()
         return
     await q.answer()
@@ -494,8 +578,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if missing:
             await q.message.reply_text("⚠️ الأسئلة دي من غير إجابة صح، حددها الأول: " + ", ".join(missing))
             return
-        await q.edit_message_text(f"⏳ بنشر {len(draft)} سؤال...")
-        failed = await publish(context, draft, q.message.chat_id)
+        if context.user_data.get("publishing"):
+            return
+        context.user_data["publishing"] = True
+        try:
+            await q.edit_message_text(f"⏳ بنشر {len(draft)} سؤال...")
+            failed = await publish(context, draft, q.message.chat_id, is_admin(q.from_user.id))
+        finally:
+            context.user_data["publishing"] = False
         context.user_data.pop("draft", None)
         report = f"✅ اتنشر {len(draft) - len(failed)} من {len(draft)}."
         if failed:
@@ -535,16 +625,41 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------- main
+async def post_init(app: Application):
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "بداية"),
+            BotCommand("help", "طريقة الاستخدام"),
+            BotCommand("undo", "مسح آخر دفعة"),
+            BotCommand("cancel", "إلغاء المسودة"),
+            BotCommand("id", "معرفة الـ id"),
+        ]
+    )
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("unhandled error", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("حصل خطأ غير متوقع. جرب تاني.")
+    except TelegramError:
+        pass
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("target", cmd_target))
     app.add_handler(CommandHandler("prefix", cmd_prefix))
     app.add_handler(CommandHandler("undo", cmd_undo))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
+    app.add_error_handler(on_error)
+    log.info("open access: %s | admins: %s", OPEN_ACCESS, len(ADMIN_IDS))
     app.run_polling()
 
 
