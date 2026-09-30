@@ -78,6 +78,7 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+USERS_POST_TO_TARGET = os.environ.get("USERS_POST_TO_TARGET", "true").strip().lower() not in {"false", "0", "no"}
 OPEN_ACCESS = os.environ.get("OPEN_ACCESS", "true").strip().lower() not in {"false", "0", "no"}
 MAX_CHARS_USER = int(os.environ.get("USER_MAX_CHARS", "15000"))  # أقصى حجم رسالة للمستخدم العادي
 AI_SEM = asyncio.Semaphore(int(os.environ.get("AI_CONCURRENCY", "3")))  # عدد طلبات AI في نفس الوقت
@@ -304,8 +305,9 @@ async def send_with_retry(coro_factory):
 
 
 async def publish(context: ContextTypes.DEFAULT_TYPE, draft: list[dict], default_chat: int, admin: bool = False):
-    # المستخدم العادي بينزل عنده هو بس. القناة والعنوان للأدمن.
-    cfg = load_config() if admin else {}
+    # النشر في القناة/الجروب المحدد (/target) لأي حد يستخدم البوت.
+    # لو USERS_POST_TO_TARGET=false المستخدم العادي بينزل عنده هو بس.
+    cfg = load_config() if (admin or USERS_POST_TO_TARGET) else {}
     chat_id = cfg.get("target") or default_chat
     prefix = cfg.get("prefix", "")
     ids, failed = [], []
@@ -340,7 +342,10 @@ async def publish(context: ContextTypes.DEFAULT_TYPE, draft: list[dict], default
 
 # ---------------------------------------------------------------- commands
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"الـ id بتاعك: {update.effective_user.id}")
+    text = f"الـ id بتاعك: {update.effective_user.id}"
+    if update.effective_chat.type != "private":
+        text += f"\nالـ id بتاع الشات ده: {update.effective_chat.id}"
+    await update.message.reply_text(text)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -397,18 +402,32 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("الأمر ده للأدمن بس.")
         return
-    if not context.args:
+    in_group = update.effective_chat.type != "private"
+    arg = context.args[0] if context.args else ("here" if in_group else None)
+    if arg is None:
         cur = load_config().get("target")
-        await update.message.reply_text(f"مكان النشر الحالي: {cur or 'هنا في الشات ده'}\nلتغييره: /target @channel أو /target -100123...")
+        await update.message.reply_text(
+            f"مكان النشر الحالي: {cur or 'هنا في الشات ده'}\n\n"
+            "لتغييره:\n/target @channel\n/target -100123456789\n\n"
+            "أو ابعت /target جوه الجروب نفسه.\n"
+            "لإلغائه: /target off"
+        )
         return
-    arg = context.args[0]
-    target = int(arg) if arg.lstrip("-").isdigit() else arg
+    cfg = load_config()
+    if arg.lower() == "off":
+        cfg.pop("target", None)
+        save_config(cfg)
+        await update.message.reply_text("اتلغى مكان النشر. هنشر في الشات الخاص.")
+        return
+    if arg.lower() == "here":
+        target = update.effective_chat.id
+    else:
+        target = int(arg) if arg.lstrip("-").isdigit() else arg
     try:
         chat = await context.bot.get_chat(target)
     except TelegramError as e:
         await update.message.reply_text(f"معرفتش أوصل للمكان ده: {e}\nتأكد إن البوت مضاف أدمن فيه.")
         return
-    cfg = load_config()
     cfg["target"] = chat.id
     save_config(cfg)
     await update.message.reply_text(f"تمام، هنشر في: {chat.title or chat.id}")
