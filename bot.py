@@ -58,24 +58,52 @@ Rules:
 
 
 # ---------------------------------------------------------------- config
-def load_config() -> dict:
-    cfg: dict = {}
+def _read_file() -> dict:
     if CONFIG_FILE.exists():
         try:
-            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         except Exception:
-            cfg = {}
-    # قيم افتراضية من .env (مفيدة في الاستضافة لأن الملفات ممكن تتمسح مع كل إعادة تشغيل)
-    env_target = os.environ.get("TARGET_CHAT", "").strip()
-    if "target" not in cfg and env_target:
-        cfg["target"] = int(env_target) if env_target.lstrip("-").isdigit() else env_target
+            pass
+    return {}
+
+
+def _to_chat(v):
+    v = str(v).strip()
+    return int(v) if v.lstrip("-").isdigit() else v
+
+
+def _env_user_targets() -> dict:
+    """USER_TARGETS=123:@chan1,456:-100999  ->  {123: '@chan1', 456: -100999}"""
+    out = {}
+    for part in os.environ.get("USER_TARGETS", "").split(","):
+        if ":" in part:
+            uid, tgt = part.split(":", 1)
+            if uid.strip().isdigit() and tgt.strip():
+                out[int(uid)] = _to_chat(tgt)
+    return out
+
+
+def load_config(uid: int | None = None) -> dict:
+    """الإعدادات الفعلية لمستخدم: الافتراضي من .env < الأدمن في USER_TARGETS < اللي ضبطه بنفسه بالأوامر."""
+    raw = _read_file()
+    cfg: dict = {k: raw[k] for k in ("target", "target_title", "prefix") if k in raw}  # قديم/عام
+    if "target" not in cfg and os.environ.get("TARGET_CHAT", "").strip():
+        cfg["target"] = _to_chat(os.environ["TARGET_CHAT"])
     if "prefix" not in cfg and os.environ.get("DEFAULT_PREFIX", "").strip():
         cfg["prefix"] = os.environ["DEFAULT_PREFIX"].strip()
+    if uid is not None:
+        env_t = _env_user_targets().get(uid)
+        if env_t is not None:
+            cfg["target"] = env_t
+            cfg.pop("target_title", None)
+        cfg.update(raw.get("users", {}).get(str(uid), {}))
     return cfg
 
 
-def save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+def set_user_cfg(uid: int, **kv) -> None:
+    raw = _read_file()
+    raw.setdefault("users", {}).setdefault(str(uid), {}).update(kv)
+    CONFIG_FILE.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 USERS_POST_TO_TARGET = os.environ.get("USERS_POST_TO_TARGET", "true").strip().lower() not in {"false", "0", "no"}
@@ -248,11 +276,14 @@ def btn(label: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(label, callback_data=data)
 
 
-def preview_view(draft: list[dict]):
+def preview_view(draft: list[dict], uid: int):
     n = len(draft)
     qw, aw = (70, 40) if n <= 20 else (50, 30) if n <= 40 else (38, 22)
     missing = sum(1 for q in draft if q["correct"] is None)
     head = f"📋 لقيت {n} سؤال\n"
+    cfg = load_config(uid) if (is_admin(uid) or USERS_POST_TO_TARGET) else {}
+    tgt = cfg.get("target")
+    head += f"📍 هينزل في: {cfg.get('target_title') or tgt}\n" if tgt else "📍 هينزل في الشات ده\n"
     if missing:
         head += f"⚠️ {missing} سؤال من غير إجابة صح (لازم تحددها قبل النشر)\n"
     foot = "\nابعت رقم السؤال لتعديله، أو دوس نشر."
@@ -304,10 +335,10 @@ async def send_with_retry(coro_factory):
             await asyncio.sleep(e.retry_after + 1)
 
 
-async def publish(context: ContextTypes.DEFAULT_TYPE, draft: list[dict], default_chat: int, admin: bool = False):
+async def publish(context: ContextTypes.DEFAULT_TYPE, draft: list[dict], default_chat: int, admin: bool = False, uid: int | None = None):
     # النشر في القناة/الجروب المحدد (/target) لأي حد يستخدم البوت.
     # لو USERS_POST_TO_TARGET=false المستخدم العادي بينزل عنده هو بس.
-    cfg = load_config() if (admin or USERS_POST_TO_TARGET) else {}
+    cfg = load_config(uid) if (admin or USERS_POST_TO_TARGET) else {}
     chat_id = cfg.get("target") or default_chat
     prefix = cfg.get("prefix", "")
     ids, failed = [], []
@@ -380,9 +411,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(uid):
         text += (
             "\n\n👑 للأدمن فقط:\n\n"
-            "📍 مكان النشر (القناة أو الجروب):\n"
+            "📍 مكان النشر بتاعك (قناة أو جروب). كل أدمن بيحدد مكانه لوحده:\n"
             "/target @channel\n\n"
-            "🔥 عنوان فوق كل سؤال (off للإلغاء):\n"
+            "🔥 عنوان فوق كل سؤالك (off للإلغاء):\n"
             "/prefix Grammar"
         )
     await update.message.reply_text(text)
@@ -399,56 +430,52 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    uid = update.effective_user.id
+    if not is_admin(uid):
         await update.message.reply_text("الأمر ده للأدمن بس.")
         return
     in_group = update.effective_chat.type != "private"
     arg = context.args[0] if context.args else ("here" if in_group else None)
     if arg is None:
-        cur = load_config().get("target")
+        cfg = load_config(uid)
+        cur = cfg.get("target_title") or cfg.get("target")
         await update.message.reply_text(
-            f"مكان النشر الحالي: {cur or 'هنا في الشات ده'}\n\n"
+            f"مكان النشر بتاعك: {cur or 'الشات الخاص'}\n\n"
             "لتغييره:\n/target @channel\n/target -100123456789\n\n"
             "أو ابعت /target جوه الجروب نفسه.\n"
-            "لإلغائه: /target off"
+            "لإلغائه: /target off\n\n"
+            "(كل أدمن بيحدد مكانه لوحده)"
         )
         return
-    cfg = load_config()
     if arg.lower() == "off":
-        cfg.pop("target", None)
-        save_config(cfg)
-        await update.message.reply_text("اتلغى مكان النشر. هنشر في الشات الخاص.")
+        set_user_cfg(uid, target=None, target_title=None)
+        await update.message.reply_text("اتلغى مكان النشر بتاعك. هتنزل الأسئلة في الشات الخاص.")
         return
-    if arg.lower() == "here":
-        target = update.effective_chat.id
-    else:
-        target = int(arg) if arg.lstrip("-").isdigit() else arg
+    target = update.effective_chat.id if arg.lower() == "here" else _to_chat(arg)
     try:
         chat = await context.bot.get_chat(target)
     except TelegramError as e:
         await update.message.reply_text(f"معرفتش أوصل للمكان ده: {e}\nتأكد إن البوت مضاف أدمن فيه.")
         return
-    cfg["target"] = chat.id
-    save_config(cfg)
-    await update.message.reply_text(f"تمام، هنشر في: {chat.title or chat.id}")
+    set_user_cfg(uid, target=chat.id, target_title=chat.title or str(chat.id))
+    await update.message.reply_text(f"تمام، أسئلتك هتنزل في: {chat.title or chat.id}")
 
 
 async def cmd_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    uid = update.effective_user.id
+    if not is_admin(uid):
         await update.message.reply_text("الأمر ده للأدمن بس.")
         return
-    cfg = load_config()
     text = " ".join(context.args).strip()
     if not text:
-        await update.message.reply_text(f"العنوان الحالي: {cfg.get('prefix') or 'مفيش'}\nلتغييره: /prefix 🔥 Grammar")
+        await update.message.reply_text(f"العنوان بتاعك: {load_config(uid).get('prefix') or 'مفيش'}\nلتغييره: /prefix 🔥 Grammar")
         return
     if text.lower() == "off":
-        cfg.pop("prefix", None)
+        set_user_cfg(uid, prefix="")
         await update.message.reply_text("اتلغى العنوان.")
     else:
-        cfg["prefix"] = text
+        set_user_cfg(uid, prefix=text)
         await update.message.reply_text(f"تمام، العنوان: {text}")
-    save_config(cfg)
 
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,7 +493,7 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.3)
     context.user_data["draft"] = batch["draft"]
     context.user_data.pop("last_batch", None)
-    text, kb = preview_view(batch["draft"])
+    text, kb = preview_view(batch["draft"], update.effective_user.id)
     await update.message.reply_text("🗑 اتمسحت. رجعتها للتعديل:\n\n" + text, reply_markup=kb)
 
 
@@ -526,7 +553,7 @@ async def handle_input_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await wait.edit_text("مالقيتش أسئلة في الرسالة دي.")
         return
     context.user_data["draft"] = parsed
-    view, kb = preview_view(parsed)
+    view, kb = preview_view(parsed, uid)
     await wait.edit_text(view, reply_markup=kb)
 
 
@@ -564,7 +591,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     act = parts[0]
 
     if act == "back":
-        text, kb = preview_view(draft)
+        text, kb = preview_view(draft, q.from_user.id)
         await q.edit_message_text(text, reply_markup=kb)
     elif act == "cancel":
         context.user_data.pop("draft", None)
@@ -579,7 +606,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["publishing"] = True
         try:
             await q.edit_message_text(f"⏳ بنشر {len(draft)} سؤال...")
-            failed = await publish(context, draft, q.message.chat_id, is_admin(q.from_user.id))
+            failed = await publish(context, draft, q.message.chat_id, is_admin(q.from_user.id), q.from_user.id)
         finally:
             context.user_data["publishing"] = False
         context.user_data.pop("draft", None)
@@ -616,7 +643,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("draft", None)
                 await q.edit_message_text("مفيش أسئلة فاضلة.")
             else:
-                text, kb = preview_view(draft)
+                text, kb = preview_view(draft, q.from_user.id)
                 await q.edit_message_text(text, reply_markup=kb)
 
 
